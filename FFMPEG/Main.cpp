@@ -10,6 +10,8 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavutil/samplefmt.h>
 #include <libavutil/timestamp.h>
+#include <libswresample/swresample.h>
+#include <libavutil/opt.h>
 
 #include <SDL.h>
 }
@@ -81,15 +83,9 @@ int SDL_main(int argc, char* argv[])
     SDL_Init(SDL_INIT_VIDEO|SDL_INIT_AUDIO);
     CHK_NZ(result, "sdl init faild");
 
-    SDL_Window* window = SDL_CreateWindow("VideoPlayer", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1024, 768, 0);
-    CHK_PTR(window, "SDL_CreateWindow failed");
-
-    SDL_Renderer* renderer =
-        //SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
-        SDL_CreateRenderer(window, -1, SDL_RENDERER_PRESENTVSYNC);
-
     
-	
+    SwrContext* swrContext = swr_alloc();
+
 	AVFormatContext* format_context{ nullptr };
 
     src_file_name = "demo.mp4";
@@ -105,12 +101,17 @@ int SDL_main(int argc, char* argv[])
 
 
 
-    std::thread audio_thread{ [&audio_device_id] () {
+    std::thread audio_thread{ [&audio_device_id, &swrContext] () {
         while (true)
         {
             if (audio_frame != nullptr) {
                 std::lock_guard<std::mutex> lock(audio_frame_mutex);
-				SDL_QueueAudio(audio_device_id, audio_frame->data[0], audio_frame->linesize[0]);
+                
+                uint8_t* ptr;
+
+                int ret = swr_convert(swrContext, &ptr, audio_frame->nb_samples, (const uint8_t**)&audio_frame->data[0], audio_frame->nb_samples);
+                if(ptr != nullptr && ret >= 0)
+				    SDL_QueueAudio(audio_device_id, ptr, audio_frame->nb_samples);
             }
             using std::chrono_literals::operator ""ms;
             std::this_thread::sleep_for(30ms);
@@ -122,13 +123,28 @@ int SDL_main(int argc, char* argv[])
         open_codec_context(&audio_stream_index, &audio_codec_ctx, format_context, AVMEDIA_TYPE_AUDIO) >= 0
         )
     {
+        width = video_codec_ctx->width;
+        height = video_codec_ctx->height;
+
+        av_opt_set_channel_layout(swrContext, "in_channel_layout", audio_codec_ctx->channel_layout, 0);
+        av_opt_set_channel_layout(swrContext, "out_channel_layout", audio_codec_ctx->channel_layout, 0);
+
+		av_opt_set_int(swrContext, "in_sample_rate", audio_codec_ctx->sample_rate, 0);
+		av_opt_set_int(swrContext, "out_sample_rate", audio_codec_ctx->sample_rate, 0);
+		av_opt_set_sample_fmt(swrContext, "in_sample_fmt", audio_codec_ctx->sample_fmt, 0);
+		av_opt_set_sample_fmt(swrContext, "out_sample_fmt", AV_SAMPLE_FMT_FLT, 0);
+		int rv = swr_init(swrContext);
+        CHK_NZ(rv, "swr init faild");
+
+
+
 		SDL_AudioSpec want, have;
 		SDL_memset(&want, 0, sizeof(want));
 
-		want.freq = audio_codec_ctx->sample_rate;
+		want.freq = audio_codec_ctx->sample_rate * 1.1;
 		want.format = AUDIO_U8;
 		want.channels = audio_codec_ctx->channels;
-        want.samples = 4096;
+        want.samples = 1024;
         want.callback = nullptr;
 
 		//want.callback = [](void* userdata, Uint8* stream,int len) {
@@ -172,8 +188,17 @@ int SDL_main(int argc, char* argv[])
     packet.data = nullptr;
 
     int got_frame{ 0 };
+
+
+	SDL_Window* window = SDL_CreateWindow("VideoPlayer", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, video_codec_ctx->width / 2, video_codec_ctx->height / 2, 0);
+	CHK_PTR(window, "SDL_CreateWindow failed");
+
+	SDL_Renderer* renderer =
+		//SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+		SDL_CreateRenderer(window, -1, SDL_RENDERER_PRESENTVSYNC);
+
     SDL_Texture* texture = 
-        SDL_CreateTexture(renderer, SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING, 1024, 768);
+        SDL_CreateTexture(renderer, SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING, video_codec_ctx->width, video_codec_ctx->height);
     while (av_read_frame(format_context, &packet) >= 0)
     {
         AVPacket orig_pkt = packet;
@@ -186,18 +211,14 @@ int SDL_main(int argc, char* argv[])
 
             SDL_RenderClear(renderer);
 
-			SDL_Rect rect;
-			rect.x = 0;
-			rect.y = 0;
-			rect.w = video_frame->width;
-			rect.h = video_frame->height;
-			SDL_UpdateYUVTexture(texture, &rect, video_frame->data[0], video_frame->linesize[0],
+
+			SDL_UpdateYUVTexture(texture, nullptr, video_frame->data[0], video_frame->linesize[0],
 				video_frame->data[1], video_frame->linesize[1],
 				video_frame->data[2], video_frame->linesize[2]
 			);
             //SDL_UpdateTexture(texture, nullptr, frame->data[0], frame->linesize[0]);
 
-            SDL_RenderCopy(renderer, texture, &rect, &rect);
+            SDL_RenderCopy(renderer, texture, nullptr, nullptr);
             SDL_RenderPresent(renderer);
 
 			
@@ -290,7 +311,7 @@ static int decode_packet(int* got_frame, int cached)
         ret = avcodec_receive_frame(video_codec_ctx, video_frame);
 
 
-        if (ret) {
+        if (!ret) {
 
             if (video_frame->width != width || video_frame->height != height ||
                 video_frame->format != pix_fmt) {
@@ -306,6 +327,9 @@ static int decode_packet(int* got_frame, int cached)
                     av_get_pix_fmt_name(static_cast<AVPixelFormat>(video_frame->format)));
                 return -1;
             }
+
+            
+            
 
             printf("video_frame%s n:%d coded_n:%d\n",
                 cached ? "(cached)" : "",
