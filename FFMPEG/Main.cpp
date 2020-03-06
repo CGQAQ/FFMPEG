@@ -1,4 +1,8 @@
+#pragma warning(disable : 4996)
 #include <iostream>
+#include <thread>
+#include <mutex>
+#include <chrono>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -6,6 +10,8 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavutil/samplefmt.h>
 #include <libavutil/timestamp.h>
+
+#include <SDL.h>
 }
 
 #define CHK_NZ(code, reason)\
@@ -46,7 +52,10 @@ static int height{ -1 };
 static AVCodecContext* video_codec_ctx{ nullptr },
 *audio_codec_ctx{ nullptr };
 
-static AVFrame* frame{ nullptr };
+static AVFrame* video_frame{ nullptr };
+static AVFrame* audio_frame{nullptr};
+static std::mutex audio_frame_mutex;
+
 static AVPixelFormat pix_fmt;
 
 static uint8_t* video_dst_data[4] = { nullptr };
@@ -66,13 +75,22 @@ static int open_codec_context(int* stream_idx,
 
 static int decode_packet(int* got_frame, int cached);
 
-int main()
+int SDL_main(int argc, char* argv[])
 {
-	int result{ 0 };
+    int result{ 0 };
+    SDL_Init(SDL_INIT_VIDEO|SDL_INIT_AUDIO);
+    CHK_NZ(result, "sdl init faild");
+
+    SDL_Window* window = SDL_CreateWindow("VideoPlayer", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1024, 768, 0);
+    CHK_PTR(window, "SDL_CreateWindow failed");
+
+    SDL_Renderer* renderer =
+        //SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+        SDL_CreateRenderer(window, -1, SDL_RENDERER_PRESENTVSYNC);
+
+    
+	
 	AVFormatContext* format_context{ nullptr };
-
-
-	AVCodec* codec{ nullptr };
 
     src_file_name = "demo.mp4";
 
@@ -80,48 +98,82 @@ int main()
 	CHK_NZ(result, "open video failed!");
 
 
-
 	result = avformat_find_stream_info(format_context, nullptr);
 	CHK_NZ(result, "avformat_find_stream_info faild");
 
-    AVStream* video_stream{ nullptr };
-    if (open_codec_context(&video_stream_index, &video_codec_ctx, format_context, AVMEDIA_TYPE_VIDEO) >= 0)
-    {
-        video_stream = format_context->streams[video_stream_index];
+    SDL_AudioDeviceID audio_device_id;
 
-        //video_dst_file = fopen(video_dst_filename, "wb");
-        //if (!video_dst_file) {
-        //    fprintf(stderr, "Could not open destination file %s\n", video_dst_filename);
-        //    ret = 1;
-        //    goto end;
-        //}
 
-        /* allocate image where the decoded image will be put */
-        width = video_codec_ctx->width;
-        height = video_codec_ctx->height;
-        pix_fmt = video_codec_ctx->pix_fmt;
-        
-        int ret = av_image_alloc(video_dst_data, video_dst_linesize,
-            width, height, pix_fmt, 1);
-        if (ret < 0) {
-            fprintf(stderr, "Could not allocate raw video buffer\n");
-            return -1;
+
+    std::thread audio_thread{ [&audio_device_id] () {
+        while (true)
+        {
+            if (audio_frame != nullptr) {
+                std::lock_guard<std::mutex> lock(audio_frame_mutex);
+				SDL_QueueAudio(audio_device_id, audio_frame->data[0], audio_frame->linesize[0]);
+            }
+            using std::chrono_literals::operator ""ms;
+            std::this_thread::sleep_for(30ms);
         }
-        video_dst_bufsize = ret;
+    }};
+    AVStream* video_stream{ nullptr };
+    if (open_codec_context(&video_stream_index, &video_codec_ctx, format_context, AVMEDIA_TYPE_VIDEO) >= 0
+        &&
+        open_codec_context(&audio_stream_index, &audio_codec_ctx, format_context, AVMEDIA_TYPE_AUDIO) >= 0
+        )
+    {
+		SDL_AudioSpec want, have;
+		SDL_memset(&want, 0, sizeof(want));
+
+		want.freq = audio_codec_ctx->sample_rate;
+		want.format = AUDIO_U8;
+		want.channels = audio_codec_ctx->channels;
+        want.samples = 4096;
+        want.callback = nullptr;
+
+		//want.callback = [](void* userdata, Uint8* stream,int len) {
+  //          if (video_frame != nullptr) {
+  //              int size = audio_frame->linesize[0],
+  //                  offset = 0;
+  //              while (size > 0) {
+  //                  int ds = FFMIN(len, size);
+  //                  SDL_memcpy(stream, audio_frame->data[0 + offset], ds);
+  //                  size -= ds;
+  //                  offset += ds;
+  //              }
+		//		
+		//		//SDL_memcpy(stream, audio_frame->data[1], audio_frame->linesize[1]);
+  //          }
+  //      };
+
+
+		audio_device_id = SDL_OpenAudioDevice(NULL, 0, &want, &have, SDL_AUDIO_ALLOW_ANY_CHANGE);
+		if (audio_device_id == 0)
+		{
+			std::cerr << "Failed to open audio: " << SDL_GetError() << "\n";
+		}
+		else
+		{
+			SDL_PauseAudioDevice(audio_device_id, 0);
+		}
     }
 
 
     av_dump_format(format_context, 0, src_file_name, 0);
 
-    frame = av_frame_alloc();
-    CHK_PTR(frame, "av_frame_alloc failed");
+    video_frame = av_frame_alloc();
+    CHK_PTR(video_frame, "av_frame_alloc video_frame failed");
+
+    audio_frame = av_frame_alloc();
+    CHK_PTR(video_frame, "av_frame_alloc audio_frame failed");
 
     av_init_packet(&packet);
     packet.size =  0 ;
     packet.data = nullptr;
 
     int got_frame{ 0 };
-
+    SDL_Texture* texture = 
+        SDL_CreateTexture(renderer, SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING, 1024, 768);
     while (av_read_frame(format_context, &packet) >= 0)
     {
         AVPacket orig_pkt = packet;
@@ -131,6 +183,26 @@ int main()
                 break;
             packet.data += result;
             packet.size -= result;
+
+            SDL_RenderClear(renderer);
+
+			SDL_Rect rect;
+			rect.x = 0;
+			rect.y = 0;
+			rect.w = video_frame->width;
+			rect.h = video_frame->height;
+			SDL_UpdateYUVTexture(texture, &rect, video_frame->data[0], video_frame->linesize[0],
+				video_frame->data[1], video_frame->linesize[1],
+				video_frame->data[2], video_frame->linesize[2]
+			);
+            //SDL_UpdateTexture(texture, nullptr, frame->data[0], frame->linesize[0]);
+
+            SDL_RenderCopy(renderer, texture, &rect, &rect);
+            SDL_RenderPresent(renderer);
+
+			
+			//SDL_QueueAudio(audio_device_id, audio_frame->data[1], audio_frame->linesize[1]);
+
         } while (packet.size > 0);
         av_packet_unref(&orig_pkt);
     }
@@ -215,13 +287,13 @@ static int decode_packet(int* got_frame, int cached)
             return ret;
         }
         
-        ret = avcodec_receive_frame(video_codec_ctx, frame);
+        ret = avcodec_receive_frame(video_codec_ctx, video_frame);
 
 
-        if (!ret) {
+        if (ret) {
 
-            if (frame->width != width || frame->height != height ||
-                frame->format != pix_fmt) {
+            if (video_frame->width != width || video_frame->height != height ||
+                video_frame->format != pix_fmt) {
                 /* To handle this change, one could call av_image_alloc again and
                  * decode the following frames into another rawvideo file. */
                 fprintf(stderr, "Error: Width, height and pixel format have to be "
@@ -230,24 +302,20 @@ static int decode_packet(int* got_frame, int cached)
                     "old: width = %d, height = %d, format = %s\n"
                     "new: width = %d, height = %d, format = %s\n",
                     width, height, av_get_pix_fmt_name(pix_fmt),
-                    frame->width, frame->height,
-                    av_get_pix_fmt_name(static_cast<AVPixelFormat>(frame->format)));
+                    video_frame->width, video_frame->height,
+                    av_get_pix_fmt_name(static_cast<AVPixelFormat>(video_frame->format)));
                 return -1;
             }
 
             printf("video_frame%s n:%d coded_n:%d\n",
                 cached ? "(cached)" : "",
-                video_frame_count++, frame->coded_picture_number);
-
-#pragma warning(disable : 4996)
-            if(video_frame_count > 50000)
-            SaveAvFrame(frame);
+                video_frame_count++, video_frame->coded_picture_number);
 
 
             /* copy decoded frame to destination buffer:
              * this is required since rawvideo expects non aligned data */
             av_image_copy(video_dst_data, video_dst_linesize,
-                (const uint8_t**)(frame->data), frame->linesize,
+                (const uint8_t**)(video_frame->data), video_frame->linesize,
                 pix_fmt, width, height);
 
             /* write to rawvideo file */
@@ -267,17 +335,18 @@ static int decode_packet(int* got_frame, int cached)
          * called again with the remainder of the packet data.
          * Sample: fate-suite/lossless-audio/luckynight-partial.shn
          * Also, some decoders might over-read the packet. */
-        decoded = FFMIN(ret, packet.size);
+        decoded = packet.size;
 
-        ret = avcodec_receive_frame(audio_codec_ctx, frame);
+        std::lock_guard<std::mutex> lock(audio_frame_mutex);
+        ret = avcodec_receive_frame(audio_codec_ctx, audio_frame);
 
         if (!ret) {
-            size_t unpadded_linesize = frame->nb_samples * av_get_bytes_per_sample(static_cast<AVSampleFormat>(frame->format));
+            size_t unpadded_linesize = audio_frame->nb_samples * av_get_bytes_per_sample(static_cast<AVSampleFormat>(audio_frame->format));
             char timestr[AV_TS_MAX_STRING_SIZE]{0};
             printf("audio_frame%s n:%d nb_samples:%d pts:%s\n",
                 cached ? "(cached)" : "",
-                audio_frame_count++, frame->nb_samples,
-                av_ts_make_time_string(timestr, frame->pts, &audio_codec_ctx->time_base)
+                audio_frame_count++, audio_frame->nb_samples,
+                av_ts_make_time_string(timestr, audio_frame->pts, &audio_codec_ctx->time_base)
                 );
 
             /* Write the raw audio data samples of the first plane. This works
@@ -294,8 +363,11 @@ static int decode_packet(int* got_frame, int cached)
 
     /* If we use frame reference counting, we own the data and need
      * to de-reference it when we don't use it anymore */
-    if (!ret && refcount)
-        av_frame_unref(frame);
+    if (!ret && refcount) {
+		av_frame_unref(audio_frame);
+        av_frame_unref(video_frame);
+    }
+
 
     return decoded;
 }
@@ -357,9 +429,8 @@ static void SaveAvFrame(AVFrame* avFrame)
     packet.data = nullptr;
     packet.size = 0;
     av_init_packet(&packet);
-    avcodec_send_frame(jpeg_context, frame);
+    avcodec_send_frame(jpeg_context, video_frame);
     avcodec_receive_packet(jpeg_context, &packet);
-
     sprintf(filename, "file-%d.jpg", video_frame_count);
     jpeg_file = fopen(filename, "wb");
     fwrite(packet.data, 1, packet.size, jpeg_file);
