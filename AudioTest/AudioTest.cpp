@@ -3,15 +3,19 @@
 
 #include <iostream>
 #include <Windows.h>
+#include <MMDeviceAPI.h>
+#include <Audioclient.h>
+#include <queue>
 
 extern "C"{
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
-
 #include <SDL.h>
 }
 
 #define RAW_OUT_ON_PLANAR false
+#define REFTIMES_PER_SEC  10000000
+#define REFTIMES_PER_MILLISEC  10000
 
 #define printErr(ret) \
 {\
@@ -19,8 +23,26 @@ char err[AV_ERROR_MAX_STRING_SIZE] = { 0 }; \
 av_strerror(ret, err, sizeof(err)); \
 fprintf(stderr, "Error decoding video frame (%s)\n", err);\
 }
+
+#define PRINT_FAILD(hr, msg)\
+if (FAILED(hr)) {\
+printf("unable to CoInitializeEx");\
+}
+
+
+template <class T> void SafeRelease(T** ppT)
+{
+	if (*ppT)
+	{
+		(*ppT)->Release();
+		*ppT = NULL;
+	}
+}
 	
 static SDL_AudioDeviceID id = 0;
+
+static std::queue<float> audio_queue;
+
 
 int receiveAndHandle(AVCodecContext* codecCtx, AVFrame* frame);
 void handleFrame(AVCodecContext* codecCtx, AVFrame* frame);
@@ -28,6 +50,34 @@ float getSample(AVCodecContext* codecCtx, uint8_t* buffer, int sampleIndex);
 
 int SDL_main(int argc, char* argv[])
 {
+	REFERENCE_TIME hnsRequestedDuration = REFTIMES_PER_SEC;
+	WAVEFORMATEX* pwfx = NULL;
+	IAudioClient* pAudioClient;
+	IMMDeviceEnumerator* deviceEnumerator = NULL;
+	IMMDevice* device;
+	HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+	PRINT_FAILD(hr, "unable to CoInitializeEx");
+
+	hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&deviceEnumerator));
+	PRINT_FAILD(hr, "CoCreateInstance MMDeviceEnumerator faild");
+
+	hr = deviceEnumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &device);
+	PRINT_FAILD(hr, "GetDefaultAudioEndpoint faild");
+
+	SafeRelease(&deviceEnumerator);
+
+	device->AddRef();
+
+	hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&pAudioClient);
+	PRINT_FAILD(hr, "device Activate faild");
+
+	hr = pAudioClient->GetMixFormat(&pwfx);
+	PRINT_FAILD(hr, "device Activate faild");
+
+	hr = pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, hnsRequestedDuration, 0, pwfx, NULL);
+	PRINT_FAILD(hr, "device Activate faild");
+
+
 	int ret_code{0};
 	AVFormatContext* format_context{nullptr};
 	avformat_open_input(&format_context, "demo.mp4", nullptr, nullptr);
@@ -163,8 +213,7 @@ void handleFrame(AVCodecContext* codecCtx, AVFrame* frame) {
 		for (int s = 0; s < frame->nb_samples; ++s) {
 			for (int c = 0; c < codecCtx->channels; ++c) {
 				float sample = getSample(codecCtx, frame->extended_data[c], s);
-				SDL_GetQueuedAudioSize(id);
-				SDL_QueueAudio(id, &sample, 1);
+				audio_queue.push(sample);
 			}
 		}
 	}
@@ -173,13 +222,17 @@ void handleFrame(AVCodecContext* codecCtx, AVFrame* frame) {
 		// => frame->extended_data[0] contains data of all channels.
 		if (RAW_OUT_ON_PLANAR) {
 			//fwrite(frame->extended_data[0], 1, frame->linesize[0], outFile);
-			SDL_QueueAudio(id, frame->extended_data[0], frame->linesize[0]);
+			for (int i = 0; i < frame->linesize[0]; ++i) {
+				audio_queue.push(frame->extended_data[0][i]);
+			}
+			//SDL_QueueAudio(id, frame->extended_data[0], frame->linesize[0]);
 		}
 		else {
 			for (int s = 0; s < frame->nb_samples; ++s) {
 				for (int c = 0; c < codecCtx->channels; ++c) {
 					float sample = getSample(codecCtx, frame->extended_data[0], s * codecCtx->channels + c);
-					SDL_QueueAudio(id, &sample, 1);
+					//SDL_QueueAudio(id, &sample, 1);
+					audio_queue.push(sample);
 				}
 			}
 		}
