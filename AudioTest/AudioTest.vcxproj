@@ -161,6 +161,7 @@ xcopy $(SolutionDir)Lib\SDL2-2.0.10\lib\x64\*.dll  $(OutputPath) /y</Command>
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="audio.cpp" />
     <ClCompile Include="AudioTest.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

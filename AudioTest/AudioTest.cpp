@@ -48,6 +48,8 @@ int receiveAndHandle(AVCodecContext* codecCtx, AVFrame* frame);
 void handleFrame(AVCodecContext* codecCtx, AVFrame* frame);
 float getSample(AVCodecContext* codecCtx, uint8_t* buffer, int sampleIndex);
 
+#if 0
+
 int SDL_main(int argc, char* argv[])
 {
 	REFERENCE_TIME hnsRequestedDuration = REFTIMES_PER_SEC;
@@ -301,3 +303,5 @@ float getSample(AVCodecContext* codecCtx, uint8_t* buffer, int sampleIndex){
 	}
 	return ret;
 }
+
+#endif
