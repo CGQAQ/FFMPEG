@@ -1,3 +1,7 @@
+#define FILENAME "demo.mkv"
+#define CG_DEBUG 1
+
+
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libswresample/swresample.h>
@@ -6,8 +10,11 @@ extern "C" {
 #include <SDL.h>
 }
 
+#include <chrono>
+#include <thread>
 #include <mutex>
 #include <queue>
+#include <list>
 
 #define PRINT_ERR(func)\
 fprintf_s(stderr, "%s faild", #func);
@@ -38,7 +45,7 @@ struct VideoData {
 	int v_len;
 };
 
-static std::queue<VideoData> vq;
+static std::list<VideoData> vq;
 static std::mutex vq_mutex;
 
 struct TParam{
@@ -62,15 +69,22 @@ static void DecodeVideoFrame(
 	AVFrame* pFrame
 );
 
+static int DelayCalc();
+
+static int loop_delay = 0;
+
 static int ThreadSDLLoop(void* data);
 static int ThreadSDLDecode(void* data);
 
 static void Output(const AVFrame& frame);
 
+static AVFormatContext* pFormatContext{ nullptr };
+static int audio_stream_index{ -1 },
+			video_stream_index{ -1 };
+
 int SDL_main(int argc, char* argv[]) {
 	int result{ 0 };
-	AVFormatContext* pFormatContext{ nullptr };
-	avformat_open_input(&pFormatContext, "demo.mp4", nullptr, nullptr);
+	avformat_open_input(&pFormatContext, FILENAME, nullptr, nullptr);
 	if (pFormatContext == nullptr) {
 		fprintf(stderr, "avformat_open_input failed");
 		return -1;
@@ -83,8 +97,8 @@ int SDL_main(int argc, char* argv[]) {
 
 	AVCodec* pAudioCodec{ nullptr },
 		* pVideoCodec{ nullptr };
-	int audio_stream_index = av_find_best_stream(pFormatContext, AVMEDIA_TYPE_AUDIO, -1, -1, &pAudioCodec, 0);
-	int video_stream_index = av_find_best_stream(pFormatContext, AVMEDIA_TYPE_VIDEO, -1, -1, &pVideoCodec, 0);
+	audio_stream_index = av_find_best_stream(pFormatContext, AVMEDIA_TYPE_AUDIO, -1, -1, &pAudioCodec, 0);
+	video_stream_index = av_find_best_stream(pFormatContext, AVMEDIA_TYPE_VIDEO, -1, -1, &pVideoCodec, 0);
 	if (pAudioCodec == nullptr) {
 		PRINT_ERR(av_find_best_stream);
 		return -1;
@@ -110,6 +124,8 @@ int SDL_main(int argc, char* argv[]) {
 	avcodec_parameters_to_context(pVideoCodecCtx, pFormatContext->streams[video_stream_index]->codecpar);
 	avcodec_open2(pAudioCodecCtx, pAudioCodec, nullptr);
 	avcodec_open2(pVideoCodecCtx, pVideoCodec, nullptr);
+
+	av_dump_format(pFormatContext, -1, FILENAME, 0);
 
 	AVPacket pkt;
 	av_init_packet(&pkt);
@@ -139,7 +155,7 @@ int SDL_main(int argc, char* argv[]) {
 	}
 
 	// video part
-	window = SDL_CreateWindow("VideoPlayer", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 960, 0);
+	window = SDL_CreateWindow("VideoPlayer", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 960, SDL_WINDOW_RESIZABLE);
 	if (window == nullptr) {
 		PRINT_ERR(SDL_CreateWindow);
 		return -1;
@@ -155,6 +171,9 @@ int SDL_main(int argc, char* argv[]) {
 		return -1;
 	}
 
+
+	loop_delay = pVideoCodecCtx->framerate.den;
+
 	TParam param;
 	param.pFormatContext = pFormatContext;
 	param.audio_stream_index = audio_stream_index;
@@ -167,7 +186,8 @@ int SDL_main(int argc, char* argv[]) {
 	SDL_CreateThread(ThreadSDLLoop, "main_loop", nullptr);
 
 	SDL_Event evMain;
-	while (true) {
+	bool quit = false;
+	while (!quit) {
 		SDL_WaitEvent(&evMain);
 		switch (evMain.type)
 		{
@@ -180,11 +200,14 @@ int SDL_main(int argc, char* argv[]) {
 				result = SDL_UpdateYUVTexture(texture, nullptr, v.y, v.y_len, v.u, v.u_len, v.v, v.v_len);
 				SDL_RenderCopy(renderer, texture, nullptr, nullptr);
 				SDL_RenderPresent(renderer);
-				/*delete[] v.y;
+				delete[] v.y;
 				delete[] v.u;
 				delete[] v.v;
-				vq.pop();*/
+				vq.pop_front();
 			}
+			break;
+		case SDL_QUIT:
+			quit = true;
 			break;
 		default:
 			break;
@@ -244,15 +267,18 @@ DecodeVideoFrame(
 		std::lock_guard<std::mutex> lock(vq_mutex);
 		VideoData vd;
 		vd.y_len = pFrame->linesize[0];
-		vd.y = new uint8_t[vd.y_len];
-		SDL_memcpy(vd.y, pFrame->extended_data[0], vd.y_len);
+		vd.y = new uint8_t[vd.y_len * pFrame->height];
+		SDL_memcpy(vd.y, pFrame->extended_data[0], vd.y_len * pFrame->height);
 		vd.u_len = pFrame->linesize[1];
-		vd.u = new uint8_t[vd.u_len];
-		SDL_memcpy(vd.u, pFrame->extended_data[1], vd.u_len);
+		vd.u = new uint8_t[vd.u_len * pFrame->height];
+		SDL_memcpy(vd.u, pFrame->extended_data[1], vd.u_len * pFrame->height/2);
 		vd.v_len = pFrame->linesize[2];
-		vd.v = new uint8_t[vd.v_len];
-		SDL_memcpy(vd.v, pFrame->extended_data[2], vd.v_len);
-		vq.push(vd);
+		vd.v = new uint8_t[vd.v_len * pFrame->height];
+		SDL_memcpy(vd.v, pFrame->extended_data[2], vd.v_len * pFrame->height/2);
+		vq.push_back(vd);
+
+		//printf("%lf\n", av_q2d(pCodecCtx->framerate));
+		loop_delay = DelayCalc();
 	}
 }
 
@@ -287,7 +313,7 @@ ThreadSDLLoop(void* data) {
 	evPlay.type = EVPLAY;
 	while (true) {
 		SDL_PushEvent(&evPlay);
-		SDL_Delay(32);
+		std::this_thread::sleep_for(std::chrono::microseconds(loop_delay));
 	}
 }
 
@@ -309,4 +335,18 @@ ThreadSDLDecode(void* data) {
 		}
 	}
 	return 0;
+}
+
+struct VideoState {
+	double video_clock;
+};
+
+
+
+int DelayCalc() {
+	int delay = floor(1.0 / av_q2d(pFormatContext->streams[video_stream_index]->r_frame_rate) * 1'000'000);
+#if CG_DEBUG==1
+	printf("delay: %ld, framerate: %lf\n", delay, ceil(av_q2d(pFormatContext->streams[video_stream_index]->r_frame_rate)));
+#endif
+	return delay;
 }
