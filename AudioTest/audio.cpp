@@ -44,6 +44,8 @@ extern "C"{
 #define AUDIO_INBUF_SIZE 20480
 #define AUDIO_REFILL_THRESH 4096
 
+#if 0
+
 static int get_format_from_sample_fmt(const char** fmt,
     enum AVSampleFormat sample_fmt)
 {
@@ -196,3 +198,6 @@ end:
 
     return 0;
 }
+
+
+#endif
