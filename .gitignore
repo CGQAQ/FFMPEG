@@ -1,5 +1,7 @@
 *.mp4
 *.yuv
+*.mkv
+*.wav
 
 **/Debug
 **/x64

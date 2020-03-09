@@ -13,6 +13,7 @@ extern "C" {
 #include <chrono>
 #include <thread>
 #include <mutex>
+#include <atomic>
 #include <queue>
 #include <list>
 
@@ -35,6 +36,8 @@ static SDL_Renderer* renderer{ nullptr };
 static SDL_Texture* texture{ nullptr };
 
 struct VideoData {
+	int64_t pts;
+
 	uint8_t* y;
 	int y_len;
 
@@ -45,8 +48,18 @@ struct VideoData {
 	int v_len;
 };
 
+struct AudioData {
+	int64_t pts;
+	uint8_t* data;
+	size_t size;
+};
+
 static std::list<VideoData> vq;
 static std::mutex vq_mutex;
+
+static std::list<AudioData> aq;
+static std::atomic_int64_t audio_pts = 0;
+static std::mutex aq_mutex;
 
 struct TParam{
 	AVFormatContext* pFormatContext;
@@ -73,6 +86,7 @@ static int DelayCalc();
 
 static int loop_delay = 0;
 
+void SDLAudioCbk(void* userdata, Uint8* stream, int len);
 static int ThreadSDLLoop(void* data);
 static int ThreadSDLDecode(void* data);
 
@@ -142,6 +156,7 @@ int SDL_main(int argc, char* argv[]) {
 	want.format = AUDIO_S16SYS;
 	want.channels = 2;
 	want.samples = 4096;
+	want.silence = 0;
 	want.callback = nullptr;
 	id = SDL_OpenAudioDevice(NULL, 0, &want, &have, SDL_AUDIO_ALLOW_SAMPLES_CHANGE);
 	if (id == 0)
@@ -200,6 +215,7 @@ int SDL_main(int argc, char* argv[]) {
 				result = SDL_UpdateYUVTexture(texture, nullptr, v.y, v.y_len, v.u, v.u_len, v.v, v.v_len);
 				SDL_RenderCopy(renderer, texture, nullptr, nullptr);
 				SDL_RenderPresent(renderer);
+				printf("%ld\n", v.pts);
 				delete[] v.y;
 				delete[] v.u;
 				delete[] v.v;
@@ -266,6 +282,7 @@ DecodeVideoFrame(
 		SDL_RenderPresent(renderer);*/
 		std::lock_guard<std::mutex> lock(vq_mutex);
 		VideoData vd;
+		vd.pts = pFrame->pts;
 		vd.y_len = pFrame->linesize[0];
 		vd.y = new uint8_t[vd.y_len * pFrame->height];
 		SDL_memcpy(vd.y, pFrame->extended_data[0], vd.y_len * pFrame->height);
@@ -279,6 +296,34 @@ DecodeVideoFrame(
 
 		//printf("%lf\n", av_q2d(pCodecCtx->framerate));
 		loop_delay = DelayCalc();
+	}
+}
+
+
+static int64_t audio_index{0};
+void 
+SDLAudioCbk(void* userdata, Uint8* stream, int len) {
+	//std::lock_guard<std::mutex> lock(aq_mutex);
+	if (aq.size() > 0) {
+		AudioData ad = aq.front();
+		if (ad.size - audio_index > len) {
+			memcpy_s(stream, len, ad.data, len);
+			//SDL_MixAudio(stream, ad.data, len, SDL_MIX_MAXVOLUME);
+			audio_index += len;
+		}
+		else {
+			memcpy_s(stream, len, ad.data + audio_index, ad.size - audio_index);
+			//memset(stream + audio_index, 0, len - ad.size + audio_index);
+			//SDL_MixAudio(stream, ad.data, ad.size - audio_index, SDL_MIX_MAXVOLUME);
+			audio_index = 0;
+			av_freep(&ad.data);
+			aq.pop_front();
+		}
+
+		//SDL_MixAudioFormat(stream, ad.data, AUDIO_S16SYS, len, SDL_MIX_MAXVOLUME);
+		//SDL_MixAudio(stream, ad.data, ad.size, SDL_MIX_MAXVOLUME);
+		
+		audio_pts = ad.pts;
 	}
 }
 
@@ -304,6 +349,7 @@ Output(const AVFrame& frame) {
 	SDL_QueueAudio(id, output, unpadded_linesize * 2);
 	//SDL_QueueAudio(id, frame.data[0], frame.linesize[0]);
 	av_freep(&output);
+	//aq.push_back(AudioData{ frame.pts, output, unpadded_linesize * 2 });
 }
 
 static
@@ -337,16 +383,11 @@ ThreadSDLDecode(void* data) {
 	return 0;
 }
 
-struct VideoState {
-	double video_clock;
-};
-
-
 
 int DelayCalc() {
 	int delay = floor(1.0 / av_q2d(pFormatContext->streams[video_stream_index]->r_frame_rate) * 1'000'000);
-#if CG_DEBUG==1
+#if CG_DEBUG==2
 	printf("delay: %ld, framerate: %lf\n", delay, ceil(av_q2d(pFormatContext->streams[video_stream_index]->r_frame_rate)));
 #endif
-	return delay;
+	return delay - 500;
 }
