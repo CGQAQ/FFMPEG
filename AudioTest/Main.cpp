@@ -1,6 +1,11 @@
 #define FILENAME "demo.mkv"
 #define CG_DEBUG 1
 
+#define NO_SYNC 1
+#define SYNC 2
+
+#define SWITCH SYNC
+
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -8,14 +13,16 @@ extern "C" {
 #include <libavutil/opt.h>
 
 #include <SDL.h>
+#include <SDL_audio.h>
 }
 
+#include <cinttypes>
 #include <chrono>
 #include <thread>
 #include <mutex>
 #include <atomic>
-#include <queue>
 #include <list>
+#include <vector>
 
 #define PRINT_ERR(func)\
 fprintf_s(stderr, "%s faild", #func);
@@ -60,6 +67,8 @@ static std::mutex vq_mutex;
 static std::list<AudioData> aq;
 static std::atomic_int64_t audio_pts = 0;
 static std::mutex aq_mutex;
+
+static std::vector<uint8_t> v;
 
 struct TParam{
 	AVFormatContext* pFormatContext;
@@ -157,7 +166,7 @@ int SDL_main(int argc, char* argv[]) {
 	want.channels = 2;
 	want.samples = 4096;
 	want.silence = 0;
-	want.callback = nullptr;
+	want.callback = SDLAudioCbk;
 	id = SDL_OpenAudioDevice(NULL, 0, &want, &have, SDL_AUDIO_ALLOW_SAMPLES_CHANGE);
 	if (id == 0)
 	{
@@ -300,31 +309,40 @@ DecodeVideoFrame(
 }
 
 
-static int64_t audio_index{0};
+
 void 
-SDLAudioCbk(void* userdata, Uint8* stream, int len) {
-	//std::lock_guard<std::mutex> lock(aq_mutex);
+SDLAudioCbk(void* userdata, Uint8* stream, int _len) {
+	static int64_t start_ops{ 0 };
+	static int64_t len{ _len };
+	std::lock_guard<std::mutex> lock(aq_mutex);
+#if SWITCH==SYNC
 	if (aq.size() > 0) {
 		AudioData ad = aq.front();
-		if (ad.size - audio_index > len) {
-			memcpy_s(stream, len, ad.data, len);
-			//SDL_MixAudio(stream, ad.data, len, SDL_MIX_MAXVOLUME);
-			audio_index += len;
+		if (len <= 0) len = _len;
+		while (len > 0) {
+			if (start_ops + len <= ad.size) {
+				memcpy_s(stream, _len, ad.data + start_ops, len);
+				start_ops += len;
+				len -= len;
+			}
+			else {
+				memcpy_s(stream, _len, ad.data + start_ops, ad.size - start_ops);
+				len -= ad.size - start_ops;
+				start_ops = 0;
+				av_freep(ad.data);
+				aq.pop_front();
+			}
 		}
-		else {
-			memcpy_s(stream, len, ad.data + audio_index, ad.size - audio_index);
-			//memset(stream + audio_index, 0, len - ad.size + audio_index);
-			//SDL_MixAudio(stream, ad.data, ad.size - audio_index, SDL_MIX_MAXVOLUME);
-			audio_index = 0;
-			av_freep(&ad.data);
-			aq.pop_front();
-		}
-
-		//SDL_MixAudioFormat(stream, ad.data, AUDIO_S16SYS, len, SDL_MIX_MAXVOLUME);
-		//SDL_MixAudio(stream, ad.data, ad.size, SDL_MIX_MAXVOLUME);
-		
-		audio_pts = ad.pts;
 	}
+	
+#elif SWITCH==NO_SYNC
+	if (start_ops + _len < v.size()) {
+		SDL_MixAudioFormat(stream, v.data() + start_ops, AUDIO_S32SYS, _len, SDL_MIX_MAXVOLUME);
+		memcpy_s(stream, _len, v.data() + start_ops, _len);
+		start_ops += _len;
+	}
+#endif
+	
 }
 
 static void
@@ -346,10 +364,19 @@ Output(const AVFrame& frame) {
 	out_samples = swr_convert(pSwrCtx, &output, out_samples, const_cast<const uint8_t**>(frame.extended_data), frame.nb_samples);
 	size_t unpadded_linesize = out_samples * bytes_persample;
 
-	SDL_QueueAudio(id, output, unpadded_linesize * 2);
+	//SDL_QueueAudio(id, output, unpadded_linesize * 2);
 	//SDL_QueueAudio(id, frame.data[0], frame.linesize[0]);
-	av_freep(&output);
+	//av_freep(&output);
 	//aq.push_back(AudioData{ frame.pts, output, unpadded_linesize * 2 });
+	std::lock_guard<std::mutex> lock(aq_mutex);
+
+#if SWITCH==NO_SYNC
+	for (uint8_t* p = output; p < output + unpadded_linesize * 2; p++) {
+		v.push_back(*p);
+	}
+#elif SWITCH==SYNC
+	aq.push_back(AudioData{ frame.pts, output, unpadded_linesize * 2 });
+#endif
 }
 
 static
