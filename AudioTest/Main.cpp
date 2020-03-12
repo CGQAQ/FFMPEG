@@ -314,30 +314,35 @@ void
 SDLAudioCbk(void* userdata, Uint8* stream, int _len) {
 	static int64_t start_ops{ 0 };
 	static int64_t len{ _len };
-	std::lock_guard<std::mutex> lock(aq_mutex);
+	static int64_t bufnum{ 0 };
+	static int64_t abuf_offset{ 0 };
 #if SWITCH==SYNC
 	if (aq.size() > 0) {
-		AudioData ad = aq.front();
-		if (len <= 0) len = _len;
+		bufnum++;
 		while (len > 0) {
-			if (start_ops + len <= ad.size) {
-				memcpy_s(stream, _len, ad.data + start_ops, len);
-				start_ops += len;
-				len -= len;
-			}
-			else {
-				memcpy_s(stream, _len, ad.data + start_ops, ad.size - start_ops);
-				len -= ad.size - start_ops;
+			AudioData& ad = aq.front();
+			int __len = FFMIN(len, ad.size - start_ops);
+			printf("#%ld  数据缓存偏移: %d, 需要读取多少数据: %d, 实际读取后的偏移: %ld, 数据大小: %ld\n", bufnum, start_ops, __len, start_ops+ __len, ad.size);
+			memcpy(stream, ad.data, __len);
+			stream += __len;
+			abuf_offset += __len;
+			len -= __len;
+			start_ops += __len;
+			printf("#%ld  音频缓存偏移: %d, 已填充: %ld, 未填充: %ld， 总大小: %ld\n", bufnum, abuf_offset, _len - len, len, _len);
+			if (start_ops >= ad.size) {
 				start_ops = 0;
-				av_freep(ad.data);
+				av_freep(&ad.data);
 				aq.pop_front();
+				printf("#%ld  数据队列pop_front\n", bufnum);
 			}
 		}
+		abuf_offset = 0;
+		len = _len;
 	}
 	
 #elif SWITCH==NO_SYNC
 	if (start_ops + _len < v.size()) {
-		SDL_MixAudioFormat(stream, v.data() + start_ops, AUDIO_S32SYS, _len, SDL_MIX_MAXVOLUME);
+		//SDL_MixAudioFormat(stream, v.data() + start_ops, AUDIO_S16SYS, _len, SDL_MIX_MAXVOLUME);
 		memcpy_s(stream, _len, v.data() + start_ops, _len);
 		start_ops += _len;
 	}
@@ -368,7 +373,6 @@ Output(const AVFrame& frame) {
 	//SDL_QueueAudio(id, frame.data[0], frame.linesize[0]);
 	//av_freep(&output);
 	//aq.push_back(AudioData{ frame.pts, output, unpadded_linesize * 2 });
-	std::lock_guard<std::mutex> lock(aq_mutex);
 
 #if SWITCH==NO_SYNC
 	for (uint8_t* p = output; p < output + unpadded_linesize * 2; p++) {
