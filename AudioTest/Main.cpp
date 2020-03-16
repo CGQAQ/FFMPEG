@@ -3,7 +3,7 @@
 
 // 0 off
 // 1 on
-#define SYNC 1
+#define SYNC 0
 
 // decode ahead of time, may consumes lots of memory if you set it very huge
 #define AHEAD 10
@@ -152,7 +152,7 @@ private:
 							, const_cast<const uint8_t**>(frame->extended_data)
 							, frame->nb_samples
 						);
-					size_t unpadded_linesize = out_samples * bytes_persample;
+					size_t unpadded_linesize = static_cast<size_t>(out_samples) * bytes_persample;
 					AudioData ad;
 					ad.pts = pkt.pts;
 					ad.size = unpadded_linesize;
@@ -179,12 +179,12 @@ private:
 						break;
 					}
 					YUVI data;
-					data.y = new uint8_t[frame->linesize[0] * frame->height];
-					data.u = new uint8_t[frame->linesize[1] * frame->height / 2];
-					data.v = new uint8_t[frame->linesize[2] * frame->height / 2];
-					memcpy(data.y, frame->extended_data[0], frame->linesize[0] * frame->height);
-					memcpy(data.u, frame->extended_data[1], frame->linesize[1] * frame->height / 2);
-					memcpy(data.v, frame->extended_data[2], frame->linesize[2] * frame->height / 2);
+					data.y = new uint8_t[static_cast<size_t>(frame->linesize[0]) * frame->height];
+					data.u = new uint8_t[static_cast<size_t>(frame->linesize[1])* frame->height / 2];
+					data.v = new uint8_t[static_cast<size_t>(frame->linesize[2])* frame->height / 2];
+					memcpy(data.y, frame->extended_data[0], static_cast<size_t>(frame->linesize[0])* frame->height);
+					memcpy(data.u, frame->extended_data[1], static_cast<size_t>(frame->linesize[1])* frame->height / 2);
+					memcpy(data.v, frame->extended_data[2], static_cast<size_t>(frame->linesize[2])* frame->height / 2);
 					data.y_line_size = frame->linesize[0];
 					data.u_line_size = frame->linesize[1];
 					data.v_line_size = frame->linesize[2];
@@ -227,37 +227,37 @@ private:
 		}
 	}
 
+	static void
 #if SYNC == 0
-	static void AudioCbk(SDL_AudioDeviceID device_id, std::shared_ptr<std::queue<AudioData>> q_audio) {
+	AudioCbk(SDL_AudioDeviceID device_id, std::shared_ptr<std::queue<AudioData>> q_audio) {
 #elif SYNC == 1
-	static void AudioCbk(void* userdata, uint8_t* stream, int len){
+	AudioCbk(void* userdata, uint8_t* stream, int len){
 		auto q_audio = *reinterpret_cast<std::shared_ptr<std::queue<AudioData>>*>(userdata);
 #endif
 #if SYNC==0
 		while (true) {
-#endif
 			q_audio_mutex.lock();
 			if (q_audio->empty()) {
 				q_audio_mutex.unlock();
-#if SYNC==0
 				continue;
-#elif SYNC==1
-				return;
-#endif
 			}
 			AudioData& ad = q_audio->front();
-			//while (ad.pts > video_pts);
-#if SYNC==1
-			memset(stream, 0, len);
-			memcpy(stream, ad.data, ad.size);
-			audio_pts = ad.pts;
-#elif SYNC==0
 			SDL_QueueAudio(device_id, ad.data, ad.size);
-#endif
 			q_audio->pop();
 			q_audio_mutex.unlock();
-#if SYNC==0
 		}
+#elif SYNC==1
+		q_audio_mutex.lock();
+		if (q_audio->empty()) {
+			q_audio_mutex.unlock();
+			return;
+		}
+		AudioData& ad = q_audio->front();
+		memset(stream, 0, len);
+		memcpy(stream, ad.data, ad.size);
+		audio_pts = ad.pts;
+		q_audio->pop();
+		q_audio_mutex.unlock();
 #endif
 	}
 
@@ -307,7 +307,6 @@ private:
 		}
 
 		SDL_AudioSpec want;
-		SDL_AudioDeviceID dev;
 		SDL_memset(&want, 0, sizeof(want));
 		want.freq = 44100;
 		want.format = AUDIO_U8;
