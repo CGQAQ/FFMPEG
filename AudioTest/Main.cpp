@@ -1,10 +1,11 @@
-#define FILENAME "demo.mp4"
+#define FILENAME "demo.mkv"
 #define CGDEBUG 1
+#define VERBOSE 0
 
 // 0 off
 // 1 on
 #define SYNC 1
-#define SYNC_THRESHOLD 10
+#define SYNC_THRESHOLD 1
 
 // decode ahead of time, may consumes lots of memory if you set it very huge
 #define AHEAD 10
@@ -54,6 +55,8 @@ static std::mutex q_audio_mutex;
 
 static std::atomic_uint64_t audio_pts{ 0 };
 static std::atomic_uint64_t video_pts{ 0 };
+
+
 
 class Player {
 public:
@@ -141,21 +144,21 @@ private:
 					}
 					//TODO: push to queue
 					uint8_t* output{ nullptr };
-					int bytes_persample = av_get_bytes_per_sample(AV_SAMPLE_FMT_U8);
-					/*int out_samples = frame->nb_samples;
+					int bytes_persample = av_get_bytes_per_sample(AV_SAMPLE_FMT_S16);
+					int out_samples = real_spec->freq;
 					out_samples =
 						av_rescale_rnd(
 							swr_get_delay(avd->swr_context, frame->sample_rate) + frame->nb_samples
-							, frame->sample_rate
+							, out_samples
 							, frame->sample_rate
 							, AV_ROUND_UP
-						);*/
-					av_samples_alloc(&output, nullptr, 1, real_spec->samples, AV_SAMPLE_FMT_U8, 1);
-					int out_samples =
+							);
+					av_samples_alloc(&output, nullptr, 1, out_samples, AV_SAMPLE_FMT_S16, 0);
+					out_samples =
 						swr_convert(
 							avd->swr_context
 							, &output
-							, real_spec->samples
+							, out_samples
 							, const_cast<const uint8_t**>(frame->extended_data)
 							, frame->nb_samples
 						);
@@ -219,6 +222,7 @@ private:
 	}
 	static void VideoCbk(SDL_Renderer* render, SDL_Texture* texture, std::shared_ptr<AVD> avd, std::shared_ptr<std::queue<YUVI>> q_video){
 		static int64_t frame_index{ 0 };
+		frame_index++;
 		while (!quit)
 		{
 			q_video_mutex.lock();
@@ -230,6 +234,7 @@ private:
 			else {
 				bool repeat = false;
 				auto& qv = q_video->front();
+#if SYNC==1
 				auto dif = static_cast<int64_t>(qv.pts * av_q2d(avd->video_stream_timebase) - audio_pts * av_q2d(avd->audio_stream_timebase));
 				if (std::abs(dif) > SYNC_THRESHOLD) {
 					if (dif < 0) {
@@ -246,21 +251,31 @@ private:
 						repeat = true;
 					}
 				}
+#endif
 				//while (qv.pts > audio_pts);
 				SDL_RenderClear(render);
 				SDL_UpdateYUVTexture(texture, nullptr, qv.y, qv.y_line_size, qv.u, qv.u_line_size, qv.v, qv.v_line_size);
-				SDL_RenderCopy(render, texture, nullptr, nullptr);
+				SDL_Rect r;
+				memset(&r, 0, sizeof(r));
+				r.w = w;
+				r.h = h;
+				SDL_RenderCopy(render, texture, nullptr, &r);
 				SDL_RenderPresent(render);
-				video_pts = qv.pts;
+				//printf("current time: %d\n", static_cast<int>(qv.pts * av_q2d(avd->video_stream_timebase)));
+				//video_pts = qv.pts;
+#if SYNC==1
 				if (!repeat) {
+#endif
 					delete[] qv.y;
 					delete[] qv.u;
 					delete[] qv.v;
 					q_video->pop();
+#if SYNC==1
 				}
 				else {
-					printf("#%d video frame repeated\n");
+					printf("#%d video frame repeated\n", frame_index);
 				}
+#endif
 			}
 			q_video_mutex.unlock();
 		}
@@ -297,8 +312,8 @@ private:
 		}
 		int audio_len = len;
 		int audio_index = 0;
-		int src_index = 0;
-		int need_len = FFMIN(audio_len, q_audio->front().size);
+		static int src_index{ 0 };
+		int need_len = FFMIN3(audio_len, q_audio->front().size, q_audio->front().size - src_index);
 
 		static int idx = 0;
 
@@ -318,7 +333,9 @@ private:
 				q_audio->pop();
 				src_index = 0;
 			}
-			//printf("#%d audio idx: %d,audio len: %d,src index: %d, need len: %d\n", idx, audio_index, audio_len, src_index, need_len);
+#if CGDEBUG==1 && VERBOSE==1
+			printf("#%d audio idx: %d,audio len: %d,src index: %d, need len: %d\n", idx, audio_index, audio_len, src_index, need_len);
+#endif
 		}
 		q_audio_mutex.unlock();
 		idx++;
@@ -327,12 +344,15 @@ private:
 
 private:
 	void MainLoop(){
-		SDL_Event ev_main;
+		SDL_Event ev_main{0};
 		while (!quit) {
 			SDL_WaitEvent(&ev_main);
 			switch (ev_main.type){
 			case SDL_QUIT:
 				quit = true;
+				break;
+			case SDL_WINDOWEVENT:
+				SDL_GetWindowSize(window, &w, &h);
 				break;
 			default:
 				break;
@@ -353,7 +373,7 @@ private:
 			SDL_WINDOWPOS_CENTERED,
 			SDL_WINDOWPOS_CENTERED,
 			1024, 768,
-			SDL_WINDOW_RESIZABLE
+			SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN
 		);
 		if (window == nullptr) {
 			throw MKERR(SDL_CreateWindow, SDL_GetError());
@@ -371,11 +391,10 @@ private:
 
 		SDL_AudioSpec want;
 		SDL_memset(&want, 0, sizeof(want));
-		want.freq = 44100;
-		want.format = AUDIO_U8;
+		want.freq = avd_->audio_codec_context->sample_rate;
+		want.format = AUDIO_S16SYS;
 		want.channels = 1;
-		want.samples = 8192;
-		want.silence = 0;
+		want.samples = 1024;
 #if SYNC==0
 		want.callback = nullptr;
 #elif SYNC==1
@@ -394,6 +413,27 @@ private:
 				LOGI("samples changed");
 			}
 			SDL_PauseAudioDevice(audio_device_id_, 0); /* start audio playing. */
+		}
+
+		avd_->swr_context =
+			swr_alloc_set_opts(
+				nullptr
+				, AV_CH_LAYOUT_MONO
+				, AV_SAMPLE_FMT_S16
+				, real_spec_.freq
+				, avd_->audio_codec_context->channel_layout
+				, avd_->audio_codec_context->sample_fmt
+				, avd_->audio_codec_context->sample_rate
+				, 0
+				, nullptr
+				);
+		if (avd_->swr_context == nullptr) {
+			throw MKERR(swr_alloc_set_opts, "unknown error");
+		}
+
+		result = swr_init(avd_->swr_context);
+		if (result != 0) {
+			AVTHROW(swr_init, result);
 		}
 	}
 	void InitFFMPEG() {
@@ -451,26 +491,11 @@ private:
 		avd_->audio_stream_timebase = avd_->format_context->streams[avd_->audio_stream_index]->time_base;
 		avd_->video_stream_timebase = avd_->format_context->streams[avd_->video_stream_index]->time_base;
 
-		avd_->swr_context =
-			swr_alloc_set_opts(
-				nullptr
-				, AV_CH_LAYOUT_MONO
-				, AV_SAMPLE_FMT_U8
-				, 44100
-				, avd_->audio_codec_context->channel_layout
-				, avd_->audio_codec_context->sample_fmt
-				, avd_->audio_codec_context->sample_rate
-				, 0
-				, nullptr
-			);
-		if (avd_->swr_context == nullptr) {
-			throw MKERR(swr_alloc_set_opts, "unknown error");
-		}
+#if CGDEBUG==1
+		av_dump_format(avd_->format_context, -1, FILENAME, 0);
+#endif
 
-		result = swr_init(avd_->swr_context);
-		if (result != 0) {
-			AVTHROW(swr_init, result);
-		}
+		
 	}
 
 public:
@@ -499,7 +524,7 @@ private:
 
 private:
 	// sdl stuff
-	int w{ 0 }, h{ 0 };
+	static int w, h;
 	SDL_Window* window{ nullptr };
 	SDL_Renderer* renderer{ nullptr }; 
 	SDL_Texture* texture{ nullptr };
@@ -519,6 +544,10 @@ private:
 	std::shared_ptr<std::queue<YUVI>> q_video_;
 	std::shared_ptr<std::queue<AudioData>> q_audio_;
 };
+
+int Player::w{ 0 };
+int Player::h{ 0 };
+
 
 int SDL_main(int argc, char* argv[])
 {
