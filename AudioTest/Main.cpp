@@ -3,7 +3,8 @@
 
 // 0 off
 // 1 on
-#define SYNC 0
+#define SYNC 1
+#define SYNC_THRESHOLD 10
 
 // decode ahead of time, may consumes lots of memory if you set it very huge
 #define AHEAD 10
@@ -15,6 +16,7 @@ extern "C" {
 #include <SDL.h>
 }
 
+#include <cinttypes>
 #include <string>
 #include <thread>
 #include <chrono>
@@ -23,7 +25,7 @@ extern "C" {
 #include <atomic>
 
 
-#define LOGI(i) printf("[INFO]" i)
+#define LOGI(i) printf("[INFO]" i "\n")
 
 #define MKERRC(f, c, r)\
 fprintf(stderr, "Function <%s> faild, error code: %d, reason: %s", #f, c, r)
@@ -44,6 +46,9 @@ else if (result != 0) {\
 	AVTHROW(f, c);\
 }
 
+static bool quit{ false };
+static uint64_t skipped_frame{ 0 };
+
 static std::mutex q_video_mutex;
 static std::mutex q_audio_mutex;
 
@@ -60,6 +65,8 @@ public:
 		AVCodecContext* video_codec_context{ nullptr };
 		int audio_stream_index{ 0 };
 		int video_stream_index{ 0 };
+		AVRational audio_stream_timebase;
+		AVRational video_stream_timebase;
 
 		SwrContext* swr_context{ nullptr };
 	};
@@ -80,12 +87,12 @@ public:
 		size_t size;
 	};
 
-//#if SYNC == 1
-//	struct QI {
-//		std::shared_ptr<std::queue<AudioData>> q_audio;
-//		SDL_AudioDeviceID id;
-//	};
-//#endif
+#if SYNC == 1
+	struct QI {
+		std::shared_ptr<std::queue<AudioData>> q_audio;
+		SDL_AudioSpec* real_spec;
+	};
+#endif
 
 public:
 	Player(const char* path): path_(path) {
@@ -100,7 +107,7 @@ public:
 		// DecodeCbk(std::shared_ptr<AVD> avd, std::shared_ptr<std::queue<YUVI>> q_video_)
 		decode_thread_ = std::make_unique<std::thread>(DecodeCbk, avd_, &real_spec_, q_video_, q_audio_);
 		// VideoCbk(SDL_Renderer* render, SDL_Texture* texture, std::shared_ptr<std::queue<YUVI>> q_video_)
-		video_thread_ = std::make_unique<std::thread>(VideoCbk, renderer, texture, q_video_);
+		video_thread_ = std::make_unique<std::thread>(VideoCbk, renderer, texture,avd_, q_video_);
 #if SYNC==0
 		audio_thread_ = std::make_unique<std::thread>(AudioCbk, audio_device_id_, q_audio_);
 #endif
@@ -118,7 +125,7 @@ private:
 		AVPacket pkt;
 		int result{ 0 };
 		av_init_packet(&pkt);
-		while (!(result = av_read_frame(avd->format_context, &pkt))) {
+		while (!(result = av_read_frame(avd->format_context, &pkt)) && !quit) {
 			// decode audio stream
 			if (pkt.stream_index == avd->audio_stream_index) {
 				result = avcodec_send_packet(avd->audio_codec_context, &pkt);
@@ -159,8 +166,8 @@ private:
 					ad.data = new uint8_t[unpadded_linesize];
 					memcpy(ad.data, output, unpadded_linesize);
 					av_freep(&output);
-					q_audio_mutex.lock();
 					while (q_audio_->size() > AHEAD);
+					q_audio_mutex.lock();
 					q_audio_->push(ad);
 					q_audio_mutex.unlock();
 				}
@@ -189,8 +196,17 @@ private:
 					data.u_line_size = frame->linesize[1];
 					data.v_line_size = frame->linesize[2];
 					data.pts = pkt.pts;
-					while (q_video_->size() > AHEAD);
-					q_video_mutex.lock();
+
+					while (true) {
+						q_video_mutex.lock();
+						if (q_video_->size() > AHEAD) {
+							q_video_mutex.unlock();
+							continue;
+						}
+						else {
+							break;
+						}
+					}
 					q_video_->push(data);
 					q_video_mutex.unlock();
 				}
@@ -201,27 +217,50 @@ private:
 		}
 		av_frame_free(&frame);
 	}
-	static void VideoCbk(SDL_Renderer* render, SDL_Texture* texture, std::shared_ptr<std::queue<YUVI>> q_video){
-		while (true)
+	static void VideoCbk(SDL_Renderer* render, SDL_Texture* texture, std::shared_ptr<AVD> avd, std::shared_ptr<std::queue<YUVI>> q_video){
+		static int64_t frame_index{ 0 };
+		while (!quit)
 		{
-			//std::this_thread::sleep_for(std::chrono::milliseconds(16));
 			q_video_mutex.lock();
+
 			if (q_video->empty()) {
 				q_video_mutex.unlock();
 				continue;
 			}
 			else {
+				bool repeat = false;
 				auto& qv = q_video->front();
+				auto dif = static_cast<int64_t>(qv.pts * av_q2d(avd->video_stream_timebase) - audio_pts * av_q2d(avd->audio_stream_timebase));
+				if (std::abs(dif) > SYNC_THRESHOLD) {
+					if (dif < 0) {
+						delete[] qv.y;
+						delete[] qv.u;
+						delete[] qv.v;
+						q_video->pop();
+						skipped_frame++;
+						printf("%" PRIu64 " frame skipped\n", skipped_frame);
+						q_video_mutex.unlock();
+						continue;
+					}
+					else {
+						repeat = true;
+					}
+				}
 				//while (qv.pts > audio_pts);
 				SDL_RenderClear(render);
 				SDL_UpdateYUVTexture(texture, nullptr, qv.y, qv.y_line_size, qv.u, qv.u_line_size, qv.v, qv.v_line_size);
 				SDL_RenderCopy(render, texture, nullptr, nullptr);
 				SDL_RenderPresent(render);
 				video_pts = qv.pts;
-				delete[] qv.y;
-				delete[] qv.u;
-				delete[] qv.v;
-				q_video->pop();
+				if (!repeat) {
+					delete[] qv.y;
+					delete[] qv.u;
+					delete[] qv.v;
+					q_video->pop();
+				}
+				else {
+					printf("#%d video frame repeated\n");
+				}
 			}
 			q_video_mutex.unlock();
 		}
@@ -232,10 +271,13 @@ private:
 	AudioCbk(SDL_AudioDeviceID device_id, std::shared_ptr<std::queue<AudioData>> q_audio) {
 #elif SYNC == 1
 	AudioCbk(void* userdata, uint8_t* stream, int len){
-		auto q_audio = *reinterpret_cast<std::shared_ptr<std::queue<AudioData>>*>(userdata);
+		auto& qi = *reinterpret_cast<QI*>(userdata);
+		auto& q_audio = qi.q_audio;
+		auto real_spec = qi.real_spec;
+
 #endif
 #if SYNC==0
-		while (true) {
+		while (!quit) {
 			q_audio_mutex.lock();
 			if (q_audio->empty()) {
 				q_audio_mutex.unlock();
@@ -250,20 +292,41 @@ private:
 		q_audio_mutex.lock();
 		if (q_audio->empty()) {
 			q_audio_mutex.unlock();
+			memset(stream, real_spec->silence, len);
 			return;
 		}
-		AudioData& ad = q_audio->front();
-		memset(stream, 0, len);
-		memcpy(stream, ad.data, ad.size);
-		audio_pts = ad.pts;
-		q_audio->pop();
+		int audio_len = len;
+		int audio_index = 0;
+		int src_index = 0;
+		int need_len = FFMIN(audio_len, q_audio->front().size);
+
+		static int idx = 0;
+
+		while (audio_len > 0) {
+			if (q_audio->empty()) {
+				memset(stream + audio_index, real_spec->silence, need_len);
+				break;
+			}
+			AudioData& ad = q_audio->front();
+			memcpy(stream + audio_index, ad.data + src_index, need_len);
+			audio_len -= need_len;
+			audio_index += need_len;
+			src_index += need_len;
+			need_len = len - audio_index;
+			audio_pts = ad.pts;
+			if (src_index >= ad.size) {
+				q_audio->pop();
+				src_index = 0;
+			}
+			//printf("#%d audio idx: %d,audio len: %d,src index: %d, need len: %d\n", idx, audio_index, audio_len, src_index, need_len);
+		}
 		q_audio_mutex.unlock();
+		idx++;
 #endif
 	}
 
 private:
 	void MainLoop(){
-		static bool quit{false};
 		SDL_Event ev_main;
 		while (!quit) {
 			SDL_WaitEvent(&ev_main);
@@ -311,12 +374,15 @@ private:
 		want.freq = 44100;
 		want.format = AUDIO_U8;
 		want.channels = 1;
-		want.samples = 1024;
+		want.samples = 8192;
+		want.silence = 0;
 #if SYNC==0
 		want.callback = nullptr;
 #elif SYNC==1
 		want.callback = AudioCbk;
-		want.userdata = &q_audio_;
+		qi_.q_audio = q_audio_;
+		qi_.real_spec = &real_spec_;
+		want.userdata = &qi_;
 #endif
 
 		audio_device_id_ = SDL_OpenAudioDevice(nullptr, 0, &want, &real_spec_, SDL_AUDIO_ALLOW_SAMPLES_CHANGE);
@@ -382,6 +448,9 @@ private:
 		if (result < 0)
 			throw MKERR(avcodec_open2, "avcodec_open2(video_codec_context_, video_codec_, nullptr)");
 	
+		avd_->audio_stream_timebase = avd_->format_context->streams[avd_->audio_stream_index]->time_base;
+		avd_->video_stream_timebase = avd_->format_context->streams[avd_->video_stream_index]->time_base;
+
 		avd_->swr_context =
 			swr_alloc_set_opts(
 				nullptr
@@ -406,9 +475,9 @@ private:
 
 public:
 	~Player() {
-		decode_thread_->join();
+		/*decode_thread_->join();
 		audio_thread_->join();
-		video_thread_->join();
+		video_thread_->join();*/
 
 		avcodec_close(avd_->audio_codec_context);
 		avcodec_close(avd_->video_codec_context);
@@ -437,6 +506,9 @@ private:
 
 	SDL_AudioSpec real_spec_;
 	SDL_AudioDeviceID audio_device_id_;
+#if SYNC==1
+	QI qi_;
+#endif
 public:
 	using string = std::string;
 	const string path_;
