@@ -164,13 +164,21 @@ private:
 						);
 					size_t unpadded_linesize = static_cast<size_t>(out_samples) * bytes_persample;
 					AudioData ad;
-					ad.pts = pkt.pts;
+					ad.pts = frame->pts;
 					ad.size = unpadded_linesize;
 					ad.data = new uint8_t[unpadded_linesize];
 					memcpy(ad.data, output, unpadded_linesize);
 					av_freep(&output);
-					while (q_audio_->size() > AHEAD);
-					q_audio_mutex.lock();
+					while (true) {
+						q_audio_mutex.lock();
+						if (q_audio_->size() > AHEAD) {
+							q_audio_mutex.unlock();
+							continue;
+						}
+						else {
+							break;
+						}
+					}
 					q_audio_->push(ad);
 					q_audio_mutex.unlock();
 				}
@@ -188,6 +196,7 @@ private:
 					else if (result == AVERROR(EAGAIN)) {
 						break;
 					}
+					//printf("%" PRIu64   " %" PRIu64 "\n", pkt.pts, frame->pts);
 					YUVI data;
 					data.y = new uint8_t[static_cast<size_t>(frame->linesize[0]) * frame->height];
 					data.u = new uint8_t[static_cast<size_t>(frame->linesize[1])* frame->height / 2];
@@ -198,7 +207,7 @@ private:
 					data.y_line_size = frame->linesize[0];
 					data.u_line_size = frame->linesize[1];
 					data.v_line_size = frame->linesize[2];
-					data.pts = pkt.pts;
+					data.pts = frame->pts;
 
 					while (true) {
 						q_video_mutex.lock();
